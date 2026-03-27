@@ -43,6 +43,7 @@ class ReleaseInfo:
     asset_name: str
     asset_url: str
     asset_size: int
+    asset_updated_at: str
 
 
 @dataclass
@@ -117,7 +118,11 @@ class UpdaterService:
             try:
                 with marker.open("r", encoding="utf-8") as f:
                     data = json.load(f)
-                return str(data.get("tag_name") or data.get("version") or "Unknown")
+                tag = str(data.get("tag_name") or data.get("version") or "Unknown")
+                asset = str(data.get("asset_name") or "").strip()
+                if asset:
+                    return f"{tag} ({asset})"
+                return tag
             except (OSError, json.JSONDecodeError):
                 pass
 
@@ -138,11 +143,12 @@ class UpdaterService:
         install_path = install_path or self.get_install_path()
         current = self.get_current_version(install_path)
         release = self._fetch_latest_windows_release()
-        latest = release.tag_name or release.name or "Unknown"
+        latest = f"{release.tag_name or release.name or 'Unknown'} ({release.asset_name})"
+        update_available = self._is_update_available(install_path=install_path, latest_release=release)
         return CheckResult(
             current_version=current,
             latest_version=latest,
-            update_available=(current != latest),
+            update_available=update_available,
             release=release,
         )
 
@@ -180,6 +186,7 @@ class UpdaterService:
                     asset_name=str(best_asset.get("name", "")),
                     asset_url=str(best_asset.get("browser_download_url", "")),
                     asset_size=int(best_asset.get("size", 0)),
+                    asset_updated_at=str(best_asset.get("updated_at", "")),
                 )
 
         raise NetworkError("No suitable Windows Stable zip artifact was found.")
@@ -304,6 +311,8 @@ class UpdaterService:
             "published_at": release.published_at,
             "release_id": release.release_id,
             "asset_name": release.asset_name,
+            "asset_size": release.asset_size,
+            "asset_updated_at": release.asset_updated_at,
         }
         try:
             marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
@@ -407,3 +416,38 @@ class UpdaterService:
 
         output = (completed.stdout or "").lower()
         return process_name.lower() in output
+
+    def _is_update_available(self, install_path: Path, latest_release: ReleaseInfo) -> bool:
+        marker = install_path / VERSION_MARKER_NAME
+        latest_signature = self._release_signature(latest_release)
+        if marker.exists():
+            try:
+                with marker.open("r", encoding="utf-8") as f:
+                    marker_data = json.load(f)
+                installed_signature = self._marker_signature(marker_data)
+                if installed_signature and latest_signature:
+                    return installed_signature != latest_signature
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        current = self.get_current_version(install_path)
+        latest_tag = latest_release.tag_name or latest_release.name or "Unknown"
+        return current != latest_tag
+
+    def _release_signature(self, release: ReleaseInfo) -> str:
+        return "|".join(
+            [
+                str(release.asset_name or ""),
+                str(release.asset_size or ""),
+                str(release.asset_updated_at or ""),
+            ]
+        )
+
+    def _marker_signature(self, marker_data: dict) -> str:
+        return "|".join(
+            [
+                str(marker_data.get("asset_name") or ""),
+                str(marker_data.get("asset_size") or ""),
+                str(marker_data.get("asset_updated_at") or ""),
+            ]
+        )
