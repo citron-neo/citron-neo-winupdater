@@ -12,6 +12,7 @@ It checks the latest continuous release from:
 - Automatic update check on startup
 - Manual **Check for Updates** and **Update Now**
 - Current version vs latest version display
+- Supports both Windows artifacts: `msvc` and `mingw` (MSVC preferred by default)
 - Modern dark-mode UI (CustomTkinter)
 - Download + extraction progress bar
 - Detailed log panel
@@ -59,9 +60,10 @@ It checks the latest continuous release from:
 1. Launch updater.
 2. On first run, choose the install/update folder in setup popup.
 3. Optional: import data from an older portable install by selecting the folder containing `user`.
-4. Click **Check for Updates**.
-5. Click **Update Now** if an update is available.
-6. Click **Launch Citron Neo** after success.
+4. Choose preferred Windows toolchain (`MSVC (recommended)` or `MinGW-w64`).
+5. Click **Check for Updates**.
+6. Click **Update Now** if an update is available.
+7. Click **Launch Citron Neo** after success.
 
 The updater stores config in:
 

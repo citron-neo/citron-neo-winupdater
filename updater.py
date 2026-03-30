@@ -17,6 +17,9 @@ REPO_API_RELEASES = "https://api.github.com/repos/citron-neo/CI/releases"
 DEFAULT_TIMEOUT = 30
 VERSION_MARKER_NAME = ".citron_updater_version.json"
 KNOWN_PROCESS_NAMES = ("citron-neo.exe", "citron.exe", "yuzu.exe")
+TOOLCHAIN_MSVC = "msvc"
+TOOLCHAIN_MINGW = "mingw"
+DEFAULT_TOOLCHAIN = TOOLCHAIN_MSVC
 CONFIG_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "CitronNeoUpdater"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_INSTALL_PATH = Path(os.getenv("APPDATA", str(Path.home()))) / "citron"
@@ -44,6 +47,7 @@ class ReleaseInfo:
     asset_url: str
     asset_size: int
     asset_updated_at: str
+    toolchain: str
 
 
 @dataclass
@@ -65,6 +69,7 @@ class ConfigStore:
                 "install_path": str(DEFAULT_INSTALL_PATH),
                 "last_installed_version": "Unknown",
                 "install_path_prompted": False,
+                "preferred_toolchain": DEFAULT_TOOLCHAIN,
             }
         try:
             with self.path.open("r", encoding="utf-8") as f:
@@ -74,11 +79,13 @@ class ConfigStore:
                 "install_path": str(DEFAULT_INSTALL_PATH),
                 "last_installed_version": "Unknown",
                 "install_path_prompted": False,
+                "preferred_toolchain": DEFAULT_TOOLCHAIN,
             }
 
         data.setdefault("install_path", str(DEFAULT_INSTALL_PATH))
         data.setdefault("last_installed_version", "Unknown")
         data.setdefault("install_path_prompted", False)
+        data.setdefault("preferred_toolchain", DEFAULT_TOOLCHAIN)
         return data
 
     def save(self, data: dict) -> None:
@@ -101,6 +108,21 @@ class UpdaterService:
     def set_install_path(self, install_path: str) -> None:
         cfg = self.config_store.load()
         cfg["install_path"] = install_path
+        self.config_store.save(cfg)
+
+    def get_preferred_toolchain(self) -> str:
+        cfg = self.config_store.load()
+        preferred = str(cfg.get("preferred_toolchain", DEFAULT_TOOLCHAIN)).lower().strip()
+        if preferred not in (TOOLCHAIN_MSVC, TOOLCHAIN_MINGW):
+            return DEFAULT_TOOLCHAIN
+        return preferred
+
+    def set_preferred_toolchain(self, toolchain: str) -> None:
+        normalized = str(toolchain).lower().strip()
+        if normalized not in (TOOLCHAIN_MSVC, TOOLCHAIN_MINGW):
+            raise UpdaterError(f"Unsupported toolchain preference: {toolchain}")
+        cfg = self.config_store.load()
+        cfg["preferred_toolchain"] = normalized
         self.config_store.save(cfg)
 
     def has_completed_install_prompt(self) -> bool:
@@ -143,7 +165,10 @@ class UpdaterService:
         install_path = install_path or self.get_install_path()
         current = self.get_current_version(install_path)
         release = self._fetch_latest_windows_release()
-        latest = f"{release.tag_name or release.name or 'Unknown'} ({release.asset_name})"
+        latest = (
+            f"{release.tag_name or release.name or 'Unknown'} "
+            f"({release.asset_name}, {release.toolchain.upper()})"
+        )
         update_available = self._is_update_available(install_path=install_path, latest_release=release)
         return CheckResult(
             current_version=current,
@@ -153,6 +178,7 @@ class UpdaterService:
         )
 
     def _fetch_latest_windows_release(self) -> ReleaseInfo:
+        preferred_toolchain = self.get_preferred_toolchain()
         try:
             resp = requests.get(REPO_API_RELEASES, timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
@@ -176,26 +202,30 @@ class UpdaterService:
             if not isinstance(assets, list):
                 continue
 
-            best_asset = self._pick_windows_stable_asset(assets)
+            best_asset = self._pick_windows_asset(assets, preferred_toolchain=preferred_toolchain)
             if best_asset:
+                asset_name = str(best_asset.get("name", ""))
                 return ReleaseInfo(
                     name=str(rel.get("name", "Continuous Build")),
                     tag_name=str(rel.get("tag_name", "Unknown")),
                     published_at=str(rel.get("published_at", "")),
                     release_id=int(rel.get("id", 0)),
-                    asset_name=str(best_asset.get("name", "")),
+                    asset_name=asset_name,
                     asset_url=str(best_asset.get("browser_download_url", "")),
                     asset_size=int(best_asset.get("size", 0)),
                     asset_updated_at=str(best_asset.get("updated_at", "")),
+                    toolchain=self._infer_asset_toolchain(asset_name),
                 )
 
-        raise NetworkError("No suitable Windows Stable zip artifact was found.")
+        raise NetworkError("No suitable Windows zip artifact was found for the selected toolchain.")
 
-    def _pick_windows_stable_asset(self, assets: list[dict]) -> Optional[dict]:
+    def _pick_windows_asset(self, assets: list[dict], preferred_toolchain: str) -> Optional[dict]:
         scored: list[tuple[int, dict]] = []
         for asset in assets:
             name = str(asset.get("name", "")).lower()
             if not name.endswith(".zip"):
+                continue
+            if "windows" not in name and "win" not in name:
                 continue
 
             score = 0
@@ -203,10 +233,30 @@ class UpdaterService:
                 score += 5
             if "stable" in name:
                 score += 4
+            if "nightly" in name:
+                score += 4
+            if "x64" in name or "amd64" in name:
+                score += 3
             if "citron" in name:
                 score += 2
             if "debug" in name or "symbols" in name:
                 score -= 3
+            if "source code" in name:
+                score -= 8
+
+            # Toolchain preference with fallback:
+            # - strongly prefer user-selected variant
+            # - still allow the other variant if preferred is unavailable
+            if preferred_toolchain == TOOLCHAIN_MSVC:
+                if TOOLCHAIN_MSVC in name:
+                    score += 10
+                if TOOLCHAIN_MINGW in name:
+                    score += 2
+            else:
+                if TOOLCHAIN_MINGW in name:
+                    score += 10
+                if TOOLCHAIN_MSVC in name:
+                    score += 2
 
             scored.append((score, asset))
 
@@ -215,6 +265,14 @@ class UpdaterService:
 
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored[0][1]
+
+    def _infer_asset_toolchain(self, asset_name: str) -> str:
+        name = asset_name.lower()
+        if TOOLCHAIN_MSVC in name:
+            return TOOLCHAIN_MSVC
+        if TOOLCHAIN_MINGW in name:
+            return TOOLCHAIN_MINGW
+        return "unknown"
 
     def download_release(
         self,
@@ -313,6 +371,7 @@ class UpdaterService:
             "asset_name": release.asset_name,
             "asset_size": release.asset_size,
             "asset_updated_at": release.asset_updated_at,
+            "toolchain": release.toolchain,
         }
         try:
             marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
