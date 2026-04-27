@@ -9,19 +9,23 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 from updater import (
+    CHANNEL_NIGHTLY,
+    CHANNEL_PR,
+    CHANNEL_STABLE,
     CheckResult,
     ReleaseInfo,
-    TOOLCHAIN_MINGW,
-    TOOLCHAIN_MSVC,
     UpdaterError,
     UpdaterService,
 )
 
-TOOLCHAIN_LABELS = {
-    TOOLCHAIN_MSVC: "MSVC (recommended)",
-    TOOLCHAIN_MINGW: "MinGW-w64",
+CHANNEL_LABELS = {
+    CHANNEL_STABLE: "Stable (citron-neo/emulator)",
+    CHANNEL_NIGHTLY: "Nightly CI - MSVC (citron-neo/CI)",
+    CHANNEL_PR: "PR Builds (citron-neo/PR)",
 }
-LABEL_TO_TOOLCHAIN = {label: key for key, label in TOOLCHAIN_LABELS.items()}
+# Order matters for the dropdown: stable, nightly, PR.
+CHANNEL_ORDER = (CHANNEL_STABLE, CHANNEL_NIGHTLY, CHANNEL_PR)
+LABEL_TO_CHANNEL = {label: key for key, label in CHANNEL_LABELS.items()}
 
 
 class UpdaterApp:
@@ -80,15 +84,15 @@ class UpdaterApp:
             font=ctk.CTkFont(size=15),
         ).grid(row=0, column=1, padx=12, pady=10, sticky="w")
 
-        self.toolchain_var = ctk.StringVar(value=TOOLCHAIN_LABELS[TOOLCHAIN_MSVC])
-        self.toolchain_menu = ctk.CTkOptionMenu(
+        self.channel_var = ctk.StringVar(value=CHANNEL_LABELS[CHANNEL_NIGHTLY])
+        self.channel_menu = ctk.CTkOptionMenu(
             version_frame,
-            variable=self.toolchain_var,
-            values=[TOOLCHAIN_LABELS[TOOLCHAIN_MSVC], TOOLCHAIN_LABELS[TOOLCHAIN_MINGW]],
-            command=self._on_toolchain_changed,
-            width=200,
+            variable=self.channel_var,
+            values=[CHANNEL_LABELS[c] for c in CHANNEL_ORDER],
+            command=self._on_channel_changed,
+            width=260,
         )
-        self.toolchain_menu.grid(row=0, column=2, padx=12, pady=10, sticky="e")
+        self.channel_menu.grid(row=0, column=2, padx=12, pady=10, sticky="e")
 
         controls_frame = ctk.CTkFrame(self.root)
         controls_frame.grid(row=2, column=0, padx=20, pady=8, sticky="ew")
@@ -171,8 +175,8 @@ class UpdaterApp:
     def _load_initial_values(self) -> None:
         install_path = self.service.get_install_path()
         self.install_path_var.set(str(install_path))
-        preferred = self.service.get_preferred_toolchain()
-        self.toolchain_var.set(TOOLCHAIN_LABELS.get(preferred, TOOLCHAIN_LABELS[TOOLCHAIN_MSVC]))
+        preferred = self.service.get_preferred_channel()
+        self.channel_var.set(CHANNEL_LABELS.get(preferred, CHANNEL_LABELS[CHANNEL_NIGHTLY]))
         self.log("Updater started.")
 
     def _maybe_show_first_run_setup(self) -> None:
@@ -289,7 +293,7 @@ class UpdaterApp:
         self.browse_btn.configure(state=button_state)
         self.launch_btn.configure(state=button_state)
         self.import_btn.configure(state=button_state)
-        self.toolchain_menu.configure(state=button_state)
+        self.channel_menu.configure(state=button_state)
         self.update_btn.configure(state=button_state if self.current_release else "disabled")
 
     def _progress_cb(self, value: float, status: str) -> None:
@@ -304,9 +308,9 @@ class UpdaterApp:
     def check_updates(self) -> None:
         def task() -> None:
             self.ui_queue.put(lambda: self.status_var.set("Status: Checking for updates..."))
-            preferred = self.service.get_preferred_toolchain().upper()
+            channel = self.service.get_preferred_channel().upper()
             self.ui_queue.put(
-                lambda p=preferred: self.log(f"Checking GitHub release (preferred toolchain: {p})...")
+                lambda c=channel: self.log(f"Checking GitHub release (channel: {c})...")
             )
             self.ui_queue.put(lambda: self.progress_bar.set(0))
             try:
@@ -336,16 +340,16 @@ class UpdaterApp:
             self.update_btn.configure(state="disabled")
             self.log("No update needed.")
 
-    def _on_toolchain_changed(self, selected_label: str) -> None:
-        toolchain = LABEL_TO_TOOLCHAIN.get(selected_label, TOOLCHAIN_MSVC)
+    def _on_channel_changed(self, selected_label: str) -> None:
+        channel = LABEL_TO_CHANNEL.get(selected_label, CHANNEL_NIGHTLY)
         try:
-            self.service.set_preferred_toolchain(toolchain)
+            self.service.set_preferred_channel(channel)
         except Exception as exc:
-            self._handle_error("Toolchain setting failed", exc)
+            self._handle_error("Channel setting failed", exc)
             return
-        self.log(f"Preferred toolchain set to {toolchain.upper()}.")
-        self.status_var.set(f"Status: Preferred toolchain: {toolchain.upper()}")
-        # Refresh release lookup to switch artifact variant immediately.
+        self.log(f"Release channel set to {channel.upper()}.")
+        self.status_var.set(f"Status: Release channel: {channel.upper()}")
+        # Refresh release lookup to switch source repository immediately.
         if not self.busy and self._startup_check_done:
             self.check_updates()
 

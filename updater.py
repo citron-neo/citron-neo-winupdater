@@ -13,13 +13,31 @@ from zipfile import BadZipFile, ZipFile
 import requests
 
 APP_NAME = "Citron Neo Updater"
-REPO_API_RELEASES = "https://api.github.com/repos/citron-neo/CI/releases"
 DEFAULT_TIMEOUT = 30
 VERSION_MARKER_NAME = ".citron_updater_version.json"
 KNOWN_PROCESS_NAMES = ("citron-neo.exe", "citron.exe", "yuzu.exe")
-TOOLCHAIN_MSVC = "msvc"
-TOOLCHAIN_MINGW = "mingw"
-DEFAULT_TOOLCHAIN = TOOLCHAIN_MSVC
+
+# Release channels.
+# Clangtron / MinGW is no longer produced upstream — only MSVC builds remain
+# on the CI channel, so toolchain selection has been removed.
+CHANNEL_STABLE = "stable"
+CHANNEL_NIGHTLY = "nightly"
+CHANNEL_PR = "pr"
+DEFAULT_CHANNEL = CHANNEL_NIGHTLY
+
+CHANNEL_RELEASE_API = {
+    CHANNEL_STABLE: "https://api.github.com/repos/citron-neo/emulator/releases",
+    CHANNEL_NIGHTLY: "https://api.github.com/repos/citron-neo/CI/releases",
+    CHANNEL_PR: "https://api.github.com/repos/citron-neo/PR/releases",
+}
+
+# Fallback for PR builds: upstream surfaces them at /tags rather than /releases.
+# We still need release assets to install binaries, but if the releases endpoint
+# is empty we can hit /tags to verify the channel exists before erroring out.
+CHANNEL_TAGS_API = {
+    CHANNEL_PR: "https://api.github.com/repos/citron-neo/PR/tags",
+}
+
 CONFIG_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "CitronNeoUpdater"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_INSTALL_PATH = Path(os.getenv("APPDATA", str(Path.home()))) / "citron"
@@ -47,7 +65,7 @@ class ReleaseInfo:
     asset_url: str
     asset_size: int
     asset_updated_at: str
-    toolchain: str
+    channel: str
 
 
 @dataclass
@@ -58,6 +76,26 @@ class CheckResult:
     release: Optional[ReleaseInfo]
 
 
+def _default_config() -> dict:
+    return {
+        "install_path": str(DEFAULT_INSTALL_PATH),
+        "last_installed_version": "Unknown",
+        "install_path_prompted": False,
+        "preferred_channel": DEFAULT_CHANNEL,
+    }
+
+
+def _normalize_channel(value: object) -> str:
+    text = str(value or "").lower().strip()
+    if text in CHANNEL_RELEASE_API:
+        return text
+    # Migrate legacy toolchain values from older configs — both toolchains map
+    # to the nightly CI channel, which is now MSVC-only.
+    if text in {"msvc", "mingw"}:
+        return CHANNEL_NIGHTLY
+    return DEFAULT_CHANNEL
+
+
 class ConfigStore:
     def __init__(self, path: Path = CONFIG_FILE) -> None:
         self.path = path
@@ -65,27 +103,22 @@ class ConfigStore:
 
     def load(self) -> dict:
         if not self.path.exists():
-            return {
-                "install_path": str(DEFAULT_INSTALL_PATH),
-                "last_installed_version": "Unknown",
-                "install_path_prompted": False,
-                "preferred_toolchain": DEFAULT_TOOLCHAIN,
-            }
+            return _default_config()
         try:
             with self.path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
-            return {
-                "install_path": str(DEFAULT_INSTALL_PATH),
-                "last_installed_version": "Unknown",
-                "install_path_prompted": False,
-                "preferred_toolchain": DEFAULT_TOOLCHAIN,
-            }
+            return _default_config()
 
-        data.setdefault("install_path", str(DEFAULT_INSTALL_PATH))
-        data.setdefault("last_installed_version", "Unknown")
-        data.setdefault("install_path_prompted", False)
-        data.setdefault("preferred_toolchain", DEFAULT_TOOLCHAIN)
+        defaults = _default_config()
+        for key, value in defaults.items():
+            data.setdefault(key, value)
+
+        # Migrate legacy preferred_toolchain key from earlier versions.
+        if "preferred_toolchain" in data and "preferred_channel" not in data:
+            data["preferred_channel"] = _normalize_channel(data.get("preferred_toolchain"))
+        data["preferred_channel"] = _normalize_channel(data.get("preferred_channel"))
+        data.pop("preferred_toolchain", None)
         return data
 
     def save(self, data: dict) -> None:
@@ -110,19 +143,16 @@ class UpdaterService:
         cfg["install_path"] = install_path
         self.config_store.save(cfg)
 
-    def get_preferred_toolchain(self) -> str:
+    def get_preferred_channel(self) -> str:
         cfg = self.config_store.load()
-        preferred = str(cfg.get("preferred_toolchain", DEFAULT_TOOLCHAIN)).lower().strip()
-        if preferred not in (TOOLCHAIN_MSVC, TOOLCHAIN_MINGW):
-            return DEFAULT_TOOLCHAIN
-        return preferred
+        return _normalize_channel(cfg.get("preferred_channel"))
 
-    def set_preferred_toolchain(self, toolchain: str) -> None:
-        normalized = str(toolchain).lower().strip()
-        if normalized not in (TOOLCHAIN_MSVC, TOOLCHAIN_MINGW):
-            raise UpdaterError(f"Unsupported toolchain preference: {toolchain}")
+    def set_preferred_channel(self, channel: str) -> None:
+        normalized = str(channel).lower().strip()
+        if normalized not in CHANNEL_RELEASE_API:
+            raise UpdaterError(f"Unsupported release channel: {channel}")
         cfg = self.config_store.load()
-        cfg["preferred_toolchain"] = normalized
+        cfg["preferred_channel"] = normalized
         self.config_store.save(cfg)
 
     def has_completed_install_prompt(self) -> bool:
@@ -142,9 +172,16 @@ class UpdaterService:
                     data = json.load(f)
                 tag = str(data.get("tag_name") or data.get("version") or "Unknown")
                 asset = str(data.get("asset_name") or "").strip()
+                channel = str(data.get("channel") or "").strip().lower()
+                channel_label = channel.upper() if channel else ""
+                pieces = [p for p in (tag, asset, channel_label) if p]
+                if asset and channel_label:
+                    return f"{tag} ({asset}, {channel_label})"
                 if asset:
                     return f"{tag} ({asset})"
-                return tag
+                if channel_label:
+                    return f"{tag} ({channel_label})"
+                return tag or "Unknown"
             except (OSError, json.JSONDecodeError):
                 pass
 
@@ -167,7 +204,7 @@ class UpdaterService:
         release = self._fetch_latest_windows_release()
         latest = (
             f"{release.tag_name or release.name or 'Unknown'} "
-            f"({release.asset_name}, {release.toolchain.upper()})"
+            f"({release.asset_name}, {release.channel.upper()})"
         )
         update_available = self._is_update_available(install_path=install_path, latest_release=release)
         return CheckResult(
@@ -178,35 +215,37 @@ class UpdaterService:
         )
 
     def _fetch_latest_windows_release(self) -> ReleaseInfo:
-        preferred_toolchain = self.get_preferred_toolchain()
+        channel = self.get_preferred_channel()
+        api_url = CHANNEL_RELEASE_API[channel]
         try:
-            resp = requests.get(REPO_API_RELEASES, timeout=DEFAULT_TIMEOUT)
+            resp = requests.get(api_url, timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
             releases = resp.json()
         except requests.RequestException as exc:
-            raise NetworkError(f"Unable to fetch release data: {exc}") from exc
+            raise NetworkError(
+                f"Unable to fetch release data for {channel} channel: {exc}"
+            ) from exc
         except ValueError as exc:
             raise NetworkError("GitHub API returned invalid JSON.") from exc
 
         if not isinstance(releases, list) or not releases:
-            raise NetworkError("No releases found for citron-neo/CI.")
+            tag_hint = self._tag_hint_for_channel(channel)
+            raise NetworkError(
+                f"No releases found on the {channel} channel.{tag_hint}"
+            )
 
-        # Prefer releases that look like continuous/stable builds for Windows.
         for rel in releases:
-            release_name = f"{rel.get('name', '')} {rel.get('tag_name', '')}".lower()
-            if "continuous" not in release_name and "stable" not in release_name:
-                # Keep scanning but do not discard if not labeled.
-                pass
-
+            if rel.get("draft"):
+                continue
             assets = rel.get("assets", [])
             if not isinstance(assets, list):
                 continue
 
-            best_asset = self._pick_windows_asset(assets, preferred_toolchain=preferred_toolchain)
+            best_asset = self._pick_windows_asset(assets)
             if best_asset:
                 asset_name = str(best_asset.get("name", ""))
                 return ReleaseInfo(
-                    name=str(rel.get("name", "Continuous Build")),
+                    name=str(rel.get("name", "") or rel.get("tag_name", "Release")),
                     tag_name=str(rel.get("tag_name", "Unknown")),
                     published_at=str(rel.get("published_at", "")),
                     release_id=int(rel.get("id", 0)),
@@ -214,50 +253,66 @@ class UpdaterService:
                     asset_url=str(best_asset.get("browser_download_url", "")),
                     asset_size=int(best_asset.get("size", 0)),
                     asset_updated_at=str(best_asset.get("updated_at", "")),
-                    toolchain=self._infer_asset_toolchain(asset_name),
+                    channel=channel,
                 )
 
-        raise NetworkError("No suitable Windows zip artifact was found for the selected toolchain.")
+        raise NetworkError(
+            f"No suitable Windows zip artifact was found on the {channel} channel."
+        )
 
-    def _pick_windows_asset(self, assets: list[dict], preferred_toolchain: str) -> Optional[dict]:
+    def _tag_hint_for_channel(self, channel: str) -> str:
+        tags_url = CHANNEL_TAGS_API.get(channel)
+        if not tags_url:
+            return ""
+        try:
+            resp = requests.get(tags_url, timeout=DEFAULT_TIMEOUT)
+            resp.raise_for_status()
+            tags = resp.json()
+        except (requests.RequestException, ValueError):
+            return ""
+        if isinstance(tags, list) and tags:
+            sample = str(tags[0].get("name", "")).strip()
+            if sample:
+                return (
+                    f" Tags exist (e.g. {sample}) but no release assets are "
+                    f"published — install requires built binaries."
+                )
+        return ""
+
+    def _pick_windows_asset(self, assets: list[dict]) -> Optional[dict]:
         scored: list[tuple[int, dict]] = []
         for asset in assets:
             name = str(asset.get("name", "")).lower()
             if not name.endswith(".zip"):
                 continue
-            if "windows" not in name and "win" not in name:
-                continue
 
             score = 0
-            if "windows" in name or "win" in name:
-                score += 5
-            if "stable" in name:
-                score += 4
-            if "nightly" in name:
-                score += 4
-            if "x64" in name or "amd64" in name:
+            if "windows" in name or "win64" in name or "win-" in name:
+                score += 6
+            elif "win" in name:
+                score += 3
+
+            if "msvc" in name:
+                score += 8
+            if "x86_64" in name or "x64" in name or "amd64" in name:
                 score += 3
             if "citron" in name:
                 score += 2
-            if "debug" in name or "symbols" in name:
-                score -= 3
-            if "source code" in name:
-                score -= 8
+            if "stable" in name:
+                score += 2
+            if "nightly" in name:
+                score += 2
 
-            # Toolchain preference with fallback:
-            # - strongly prefer user-selected variant
-            # - still allow the other variant if preferred is unavailable
-            if preferred_toolchain == TOOLCHAIN_MSVC:
-                if TOOLCHAIN_MSVC in name:
-                    score += 10
-                if TOOLCHAIN_MINGW in name:
-                    score += 2
-            else:
-                if TOOLCHAIN_MINGW in name:
-                    score += 10
-                if TOOLCHAIN_MSVC in name:
-                    score += 2
+            # Removed/undesired variants.
+            if "mingw" in name or "clang" in name or "clangtron" in name:
+                score -= 50
+            if "debug" in name or "symbols" in name or "pdb" in name:
+                score -= 4
+            if "source" in name or name.endswith(("-src.zip", "_src.zip")):
+                score -= 10
 
+            if score <= 0:
+                continue
             scored.append((score, asset))
 
         if not scored:
@@ -265,14 +320,6 @@ class UpdaterService:
 
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored[0][1]
-
-    def _infer_asset_toolchain(self, asset_name: str) -> str:
-        name = asset_name.lower()
-        if TOOLCHAIN_MSVC in name:
-            return TOOLCHAIN_MSVC
-        if TOOLCHAIN_MINGW in name:
-            return TOOLCHAIN_MINGW
-        return "unknown"
 
     def download_release(
         self,
@@ -371,7 +418,7 @@ class UpdaterService:
             "asset_name": release.asset_name,
             "asset_size": release.asset_size,
             "asset_updated_at": release.asset_updated_at,
-            "toolchain": release.toolchain,
+            "channel": release.channel,
         }
         try:
             marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
@@ -496,6 +543,7 @@ class UpdaterService:
     def _release_signature(self, release: ReleaseInfo) -> str:
         return "|".join(
             [
+                str(release.channel or ""),
                 str(release.asset_name or ""),
                 str(release.asset_size or ""),
                 str(release.asset_updated_at or ""),
@@ -505,6 +553,7 @@ class UpdaterService:
     def _marker_signature(self, marker_data: dict) -> str:
         return "|".join(
             [
+                str(marker_data.get("channel") or ""),
                 str(marker_data.get("asset_name") or ""),
                 str(marker_data.get("asset_size") or ""),
                 str(marker_data.get("asset_updated_at") or ""),

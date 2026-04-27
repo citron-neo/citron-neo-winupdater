@@ -2,17 +2,21 @@
 
 Official external updater utility for **Citron Neo** (Windows only), built with Python + CustomTkinter.
 
-It checks the latest continuous release from:
+It can pull builds from any of three official channels:
 
-- Repository: <https://github.com/citron-neo/CI>
-- GitHub Releases API: <https://api.github.com/repos/citron-neo/CI/releases>
+- **Stable** — <https://github.com/citron-neo/emulator/releases>
+- **Nightly CI (MSVC)** — <https://github.com/citron-neo/CI/releases>
+- **PR Builds** — <https://github.com/citron-neo/PR/tags> (release assets are pulled from `citron-neo/PR/releases`)
+
+The Clangtron (MinGW-w64) toolchain is no longer produced upstream, so the
+nightly CI channel only ships MSVC artifacts.
 
 ## Features
 
 - Automatic update check on startup
 - Manual **Check for Updates** and **Update Now**
 - Current version vs latest version display
-- Supports both Windows artifacts: `msvc` and `mingw` (MSVC preferred by default)
+- Switchable release channel: Stable / Nightly CI / PR Builds (Nightly CI is the default)
 - Modern dark-mode UI (CustomTkinter)
 - Download + extraction progress bar
 - Detailed log panel
@@ -60,10 +64,14 @@ It checks the latest continuous release from:
 1. Launch updater.
 2. On first run, choose the install/update folder in setup popup.
 3. Optional: import data from an older portable install by selecting the folder containing `user`.
-4. Choose preferred Windows toolchain (`MSVC (recommended)` or `MinGW-w64`).
+4. Choose a release channel (`Stable`, `Nightly CI - MSVC`, or `PR Builds`).
 5. Click **Check for Updates**.
 6. Click **Update Now** if an update is available.
 7. Click **Launch Citron Neo** after success.
+
+Switching the channel triggers a fresh check against the new repository.
+Builds applied from different channels are tracked independently — moving from
+nightly to stable (or vice versa) will be detected as an update.
 
 The updater stores config in:
 
