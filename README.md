@@ -5,18 +5,26 @@ Official external updater utility for **Citron Neo** (Windows only), built with 
 It can pull builds from any of three official channels:
 
 - **Stable** — <https://github.com/citron-neo/emulator/releases>
-- **Nightly CI (MSVC)** — <https://github.com/citron-neo/CI/releases>
-- **PR Builds** — <https://github.com/citron-neo/PR/tags> (release assets are pulled from `citron-neo/PR/releases`)
+- **Nightly CI (Clangtron)** — <https://github.com/citron-neo/CI/releases>
+- **PR Builds** — open pull requests on <https://github.com/citron-neo/emulator/pulls>; per-PR Windows artifacts are pulled from the `**Build Artifacts for PR #N**` comment (powered by [nightly.link](https://nightly.link/))
 
-The Clangtron (MinGW-w64) toolchain is no longer produced upstream, so the
-nightly CI channel only ships MSVC artifacts.
+Upstream no longer ships the MSVC or MinGW-w64 Windows toolchains. The only
+Windows artifact produced is the Clangtron build (Clang LTO cross-compiled
+from Linux), e.g. `Citron-windows-nightly-<sha>-x64-clangtron.zip`.
+
+For the **PR Builds** channel, the updater scans the most recently updated
+open PRs on `citron-neo/emulator`. For each PR it reads the build-artifact
+comment posted to the PR, extracts the Windows Clangtron download URL (only
+URLs hosted on `nightly.link` are accepted), and presents the PRs in a
+dropdown together with their build status (`ready`, `building`, or
+`no Windows build`).
 
 ## Features
 
 - Automatic update check on startup
 - Manual **Check for Updates** and **Update Now**
 - Current version vs latest version display
-- Switchable release channel: Stable / Nightly CI / PR Builds (Nightly CI is the default)
+- Switchable release channel: Stable / Nightly CI (Clangtron) / PR Builds (Nightly CI is the default)
 - Modern dark-mode UI (CustomTkinter)
 - Download + extraction progress bar
 - Detailed log panel
@@ -64,14 +72,20 @@ nightly CI channel only ships MSVC artifacts.
 1. Launch updater.
 2. On first run, choose the install/update folder in setup popup.
 3. Optional: import data from an older portable install by selecting the folder containing `user`.
-4. Choose a release channel (`Stable`, `Nightly CI - MSVC`, or `PR Builds`).
+4. Choose a release channel (`Stable`, `Nightly CI - Clangtron`, or `PR Builds`).
 5. Click **Check for Updates**.
-6. Click **Update Now** if an update is available.
-7. Click **Launch Citron Neo** after success.
+6. For **PR Builds**, pick an open PR from the dropdown that became visible.
+   The summary line tells you whether its Windows build is `ready`, still
+   `building`, or has no usable Windows artifact. Use **Open PR on GitHub**
+   to open the PR thread in your browser.
+7. Click **Update Now** if an update is available.
+8. Click **Launch Citron Neo** after success.
 
 Switching the channel triggers a fresh check against the new repository.
 Builds applied from different channels are tracked independently — moving from
-nightly to stable (or vice versa) will be detected as an update.
+nightly to stable (or to a specific PR build) will be detected as an update.
+Installed PR builds are recorded as `pr-<number>-<short-sha>` so re-checking a
+PR after CI rebuilds the same commit will not trigger a redundant download.
 
 The updater stores config in:
 

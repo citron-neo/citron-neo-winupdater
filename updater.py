@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 from zipfile import BadZipFile, ZipFile
 
 import requests
@@ -18,8 +20,12 @@ VERSION_MARKER_NAME = ".citron_updater_version.json"
 KNOWN_PROCESS_NAMES = ("citron-neo.exe", "citron.exe", "yuzu.exe")
 
 # Release channels.
-# Clangtron / MinGW is no longer produced upstream — only MSVC builds remain
-# on the CI channel, so toolchain selection has been removed.
+# Upstream no longer ships MSVC or MinGW Windows builds — the only Windows
+# toolchain produced is Clangtron (Clang LTO cross-compiled from Linux),
+# served from the citron-neo/CI nightly-windows release. PR builds are now
+# discovered by scanning open PRs on citron-neo/emulator and reading the
+# "Build Artifacts for PR #N" comment that links direct downloads via
+# nightly.link.
 CHANNEL_STABLE = "stable"
 CHANNEL_NIGHTLY = "nightly"
 CHANNEL_PR = "pr"
@@ -28,15 +34,45 @@ DEFAULT_CHANNEL = CHANNEL_NIGHTLY
 CHANNEL_RELEASE_API = {
     CHANNEL_STABLE: "https://api.github.com/repos/citron-neo/emulator/releases",
     CHANNEL_NIGHTLY: "https://api.github.com/repos/citron-neo/CI/releases",
-    CHANNEL_PR: "https://api.github.com/repos/citron-neo/PR/releases",
 }
 
-# Fallback for PR builds: upstream surfaces them at /tags rather than /releases.
-# We still need release assets to install binaries, but if the releases endpoint
-# is empty we can hit /tags to verify the channel exists before erroring out.
-CHANNEL_TAGS_API = {
-    CHANNEL_PR: "https://api.github.com/repos/citron-neo/PR/tags",
+# Channels the user may select. PR is sourced from open PRs on
+# citron-neo/emulator instead of a releases endpoint, so it isn't part of
+# CHANNEL_RELEASE_API but is still a valid channel.
+SUPPORTED_CHANNELS = frozenset({CHANNEL_STABLE, CHANNEL_NIGHTLY, CHANNEL_PR})
+
+EMULATOR_PRS_API = "https://api.github.com/repos/citron-neo/emulator/pulls"
+EMULATOR_PR_COMMENTS_API = (
+    "https://api.github.com/repos/citron-neo/emulator/issues/{number}/comments"
+)
+EMULATOR_PR_HTML_URL = "https://github.com/citron-neo/emulator/pull/{number}"
+
+GITHUB_API_HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "CitronNeoUpdater",
 }
+
+# Cap how many PRs we look up so we don't hammer the GitHub API for every open
+# PR (and run into anonymous rate limits).
+PR_FETCH_LIMIT = 25
+
+# Restrict PR artifact URLs to nightly.link to avoid being tricked into
+# downloading from arbitrary hosts via crafted PR comments.
+ALLOWED_PR_ARTIFACT_HOST = "nightly.link"
+
+PR_ARTIFACT_HEADER_RE = re.compile(r"\*\*Build Artifacts for PR\b", re.IGNORECASE)
+PR_WINDOWS_ROW_RE = re.compile(
+    r"\|\s*\*\*Windows\*\*\s*\|"
+    r"(?P<commit>[^|]*)\|"
+    r"(?P<artifacts>[^|]*)\|"
+    r"(?P<logs>[^|]*)\|",
+    re.IGNORECASE,
+)
+PR_MD_LINK_RE = re.compile(r"\[(?P<label>[^\]]+)\]\((?P<url>[^)]+)\)")
+
+PR_BUILD_STATUS_READY = "ready"
+PR_BUILD_STATUS_BUILDING = "building"
+PR_BUILD_STATUS_MISSING = "missing"
 
 CONFIG_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "CitronNeoUpdater"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -69,11 +105,39 @@ class ReleaseInfo:
 
 
 @dataclass
+class PullRequestBuild:
+    number: int
+    title: str
+    author: str
+    head_sha: str
+    short_sha: str
+    pr_url: str
+    updated_at: str
+    status: str  # one of PR_BUILD_STATUS_*
+    artifact_label: Optional[str] = None
+    artifact_url: Optional[str] = None
+    run_url: Optional[str] = None
+
+    @property
+    def display_label(self) -> str:
+        title = " ".join(self.title.split()) or "Untitled PR"
+        if len(title) > 70:
+            title = title[:67] + "..."
+        suffix = {
+            PR_BUILD_STATUS_READY: "ready",
+            PR_BUILD_STATUS_BUILDING: "building",
+            PR_BUILD_STATUS_MISSING: "no Windows build",
+        }.get(self.status, self.status)
+        return f"#{self.number} ({suffix}) - {title}"
+
+
+@dataclass
 class CheckResult:
     current_version: str
     latest_version: str
     update_available: bool
     release: Optional[ReleaseInfo]
+    pull_requests: list[PullRequestBuild] = field(default_factory=list)
 
 
 def _default_config() -> dict:
@@ -87,11 +151,12 @@ def _default_config() -> dict:
 
 def _normalize_channel(value: object) -> str:
     text = str(value or "").lower().strip()
-    if text in CHANNEL_RELEASE_API:
+    if text in SUPPORTED_CHANNELS:
         return text
-    # Migrate legacy toolchain values from older configs — both toolchains map
-    # to the nightly CI channel, which is now MSVC-only.
-    if text in {"msvc", "mingw"}:
+    # Migrate legacy toolchain values from older configs. The MSVC and MinGW
+    # toolchains were retired upstream; both now resolve to the nightly CI
+    # channel (Clangtron-only).
+    if text in {"msvc", "mingw", "clang", "clangtron"}:
         return CHANNEL_NIGHTLY
     return DEFAULT_CHANNEL
 
@@ -149,7 +214,7 @@ class UpdaterService:
 
     def set_preferred_channel(self, channel: str) -> None:
         normalized = str(channel).lower().strip()
-        if normalized not in CHANNEL_RELEASE_API:
+        if normalized not in SUPPORTED_CHANNELS:
             raise UpdaterError(f"Unsupported release channel: {channel}")
         cfg = self.config_store.load()
         cfg["preferred_channel"] = normalized
@@ -201,12 +266,33 @@ class UpdaterService:
     def check_for_updates(self, install_path: Optional[Path] = None) -> CheckResult:
         install_path = install_path or self.get_install_path()
         current = self.get_current_version(install_path)
-        release = self._fetch_latest_windows_release()
+        channel = self.get_preferred_channel()
+
+        if channel == CHANNEL_PR:
+            prs = self.fetch_open_pull_requests()
+            ready_count = sum(1 for pr in prs if pr.status == PR_BUILD_STATUS_READY)
+            if not prs:
+                latest = "No open PRs found"
+            elif ready_count:
+                latest = f"{ready_count} PR build(s) ready"
+            else:
+                latest = "No PR Windows builds ready yet"
+            return CheckResult(
+                current_version=current,
+                latest_version=latest,
+                update_available=False,
+                release=None,
+                pull_requests=prs,
+            )
+
+        release = self._fetch_latest_windows_release(channel=channel)
         latest = (
             f"{release.tag_name or release.name or 'Unknown'} "
             f"({release.asset_name}, {release.channel.upper()})"
         )
-        update_available = self._is_update_available(install_path=install_path, latest_release=release)
+        update_available = self._is_update_available(
+            install_path=install_path, latest_release=release
+        )
         return CheckResult(
             current_version=current,
             latest_version=latest,
@@ -214,11 +300,18 @@ class UpdaterService:
             release=release,
         )
 
-    def _fetch_latest_windows_release(self) -> ReleaseInfo:
-        channel = self.get_preferred_channel()
-        api_url = CHANNEL_RELEASE_API[channel]
+    def _fetch_latest_windows_release(self, channel: str) -> ReleaseInfo:
+        api_url = CHANNEL_RELEASE_API.get(channel)
+        if not api_url:
+            raise UpdaterError(
+                f"Channel {channel!r} does not expose GitHub releases."
+            )
         try:
-            resp = requests.get(api_url, timeout=DEFAULT_TIMEOUT)
+            resp = requests.get(
+                api_url,
+                timeout=DEFAULT_TIMEOUT,
+                headers=GITHUB_API_HEADERS,
+            )
             resp.raise_for_status()
             releases = resp.json()
         except requests.RequestException as exc:
@@ -229,10 +322,7 @@ class UpdaterService:
             raise NetworkError("GitHub API returned invalid JSON.") from exc
 
         if not isinstance(releases, list) or not releases:
-            tag_hint = self._tag_hint_for_channel(channel)
-            raise NetworkError(
-                f"No releases found on the {channel} channel.{tag_hint}"
-            )
+            raise NetworkError(f"No releases found on the {channel} channel.")
 
         for rel in releases:
             if rel.get("draft"):
@@ -257,27 +347,179 @@ class UpdaterService:
                 )
 
         raise NetworkError(
-            f"No suitable Windows zip artifact was found on the {channel} channel."
+            f"No suitable Windows Clangtron zip artifact was found on the "
+            f"{channel} channel."
         )
 
-    def _tag_hint_for_channel(self, channel: str) -> str:
-        tags_url = CHANNEL_TAGS_API.get(channel)
-        if not tags_url:
-            return ""
+    def fetch_open_pull_requests(self) -> list[PullRequestBuild]:
         try:
-            resp = requests.get(tags_url, timeout=DEFAULT_TIMEOUT)
+            resp = requests.get(
+                EMULATOR_PRS_API,
+                params={
+                    "state": "open",
+                    "per_page": PR_FETCH_LIMIT,
+                    "sort": "updated",
+                    "direction": "desc",
+                },
+                timeout=DEFAULT_TIMEOUT,
+                headers=GITHUB_API_HEADERS,
+            )
             resp.raise_for_status()
-            tags = resp.json()
-        except (requests.RequestException, ValueError):
-            return ""
-        if isinstance(tags, list) and tags:
-            sample = str(tags[0].get("name", "")).strip()
-            if sample:
-                return (
-                    f" Tags exist (e.g. {sample}) but no release assets are "
-                    f"published — install requires built binaries."
+            payload = resp.json()
+        except requests.RequestException as exc:
+            raise NetworkError(f"Unable to fetch open pull requests: {exc}") from exc
+        except ValueError as exc:
+            raise NetworkError("GitHub API returned invalid JSON for PR list.") from exc
+
+        if not isinstance(payload, list):
+            raise NetworkError("Unexpected PR list payload from GitHub.")
+
+        results: list[PullRequestBuild] = []
+        for pr in payload:
+            if not isinstance(pr, dict):
+                continue
+            number = int(pr.get("number", 0) or 0)
+            if not number:
+                continue
+            head = pr.get("head") or {}
+            head_sha = str(head.get("sha", "") or "")
+            user = pr.get("user") or {}
+            artifact = self._fetch_pr_windows_artifact(number)
+            results.append(
+                PullRequestBuild(
+                    number=number,
+                    title=str(pr.get("title", "") or "Untitled PR"),
+                    author=str(user.get("login", "") or "unknown"),
+                    head_sha=head_sha,
+                    short_sha=head_sha[:7],
+                    pr_url=str(
+                        pr.get("html_url", "")
+                        or EMULATOR_PR_HTML_URL.format(number=number)
+                    ),
+                    updated_at=str(pr.get("updated_at", "") or ""),
+                    status=artifact.get("status", PR_BUILD_STATUS_MISSING),
+                    artifact_label=artifact.get("label"),
+                    artifact_url=artifact.get("url"),
+                    run_url=artifact.get("run"),
                 )
-        return ""
+            )
+
+        return results
+
+    def _fetch_pr_windows_artifact(self, pr_number: int) -> dict:
+        try:
+            resp = requests.get(
+                EMULATOR_PR_COMMENTS_API.format(number=pr_number),
+                timeout=DEFAULT_TIMEOUT,
+                headers=GITHUB_API_HEADERS,
+                params={"per_page": 100},
+            )
+            resp.raise_for_status()
+            comments = resp.json()
+        except (requests.RequestException, ValueError):
+            return {"status": PR_BUILD_STATUS_MISSING}
+
+        if not isinstance(comments, list):
+            return {"status": PR_BUILD_STATUS_MISSING}
+
+        # Walk newest -> oldest so the freshest build comment wins, but fall
+        # back to "building" if older comments only show in-progress state.
+        building_seen = False
+        for comment in reversed(comments):
+            if not isinstance(comment, dict):
+                continue
+            body = str(comment.get("body", "") or "")
+            if not PR_ARTIFACT_HEADER_RE.search(body):
+                continue
+            parsed = self._parse_pr_artifact_comment(body)
+            if not parsed:
+                continue
+            if parsed["status"] == PR_BUILD_STATUS_READY:
+                return parsed
+            if parsed["status"] == PR_BUILD_STATUS_BUILDING:
+                building_seen = True
+        if building_seen:
+            return {"status": PR_BUILD_STATUS_BUILDING}
+        return {"status": PR_BUILD_STATUS_MISSING}
+
+    def _parse_pr_artifact_comment(self, body: str) -> Optional[dict]:
+        match = PR_WINDOWS_ROW_RE.search(body)
+        if not match:
+            return None
+
+        artifacts_cell = match.group("artifacts").strip()
+        logs_cell = match.group("logs").strip()
+
+        if not artifacts_cell or "building" in artifacts_cell.lower():
+            return {"status": PR_BUILD_STATUS_BUILDING}
+
+        links = PR_MD_LINK_RE.findall(artifacts_cell)
+        chosen_label: Optional[str] = None
+        chosen_url: Optional[str] = None
+
+        # Prefer Clangtron — the only Windows toolchain produced upstream.
+        for label, url in links:
+            if not self._is_acceptable_pr_artifact_url(url):
+                continue
+            blob = (label + " " + url).lower()
+            if "clangtron" in blob:
+                chosen_label, chosen_url = label, url
+                break
+
+        # Fall back to any other Windows artifact that isn't a discontinued
+        # MSVC/MinGW toolchain build.
+        if not chosen_url:
+            for label, url in links:
+                if not self._is_acceptable_pr_artifact_url(url):
+                    continue
+                blob = (label + " " + url).lower()
+                if "msvc" in blob or "mingw" in blob:
+                    continue
+                chosen_label, chosen_url = label, url
+                break
+
+        if not chosen_url:
+            # Build is up but only MSVC/MinGW artifacts are present, which we
+            # treat as no usable Windows build.
+            return {"status": PR_BUILD_STATUS_MISSING}
+
+        run_match = PR_MD_LINK_RE.search(logs_cell)
+        run_url = run_match.group("url") if run_match else None
+
+        return {
+            "status": PR_BUILD_STATUS_READY,
+            "label": chosen_label or "Windows",
+            "url": chosen_url,
+            "run": run_url,
+        }
+
+    def _is_acceptable_pr_artifact_url(self, url: str) -> bool:
+        if not url.lower().endswith(".zip"):
+            return False
+        try:
+            host = urlparse(url).hostname or ""
+        except ValueError:
+            return False
+        return host.lower() == ALLOWED_PR_ARTIFACT_HOST
+
+    def pr_build_to_release_info(self, pr: PullRequestBuild) -> ReleaseInfo:
+        if pr.status != PR_BUILD_STATUS_READY or not pr.artifact_url:
+            raise UpdaterError(
+                f"PR #{pr.number} does not have a ready Windows Clangtron build yet."
+            )
+        label_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", pr.artifact_label or "Windows").strip("-") or "Windows"
+        asset_name = f"Citron-PR-{pr.number}-{pr.short_sha or 'unknown'}-{label_slug}.zip"
+        return ReleaseInfo(
+            name=f"PR #{pr.number}: {pr.title}",
+            tag_name=f"pr-{pr.number}-{pr.short_sha}" if pr.short_sha else f"pr-{pr.number}",
+            published_at=pr.updated_at,
+            release_id=pr.number,
+            asset_name=asset_name,
+            asset_url=pr.artifact_url,
+            asset_size=0,
+            asset_updated_at=pr.updated_at,
+            channel=CHANNEL_PR,
+        )
 
     def _pick_windows_asset(self, assets: list[dict]) -> Optional[dict]:
         scored: list[tuple[int, dict]] = []
@@ -286,14 +528,25 @@ class UpdaterService:
             if not name.endswith(".zip"):
                 continue
 
+            # Hard reject discontinued toolchains. Upstream stopped producing
+            # MSVC and MinGW Windows builds; only Clangtron (Clang LTO) is
+            # shipped, so we never select these even if older releases still
+            # have the artifacts attached.
+            if "msvc" in name or "mingw" in name:
+                continue
+
             score = 0
             if "windows" in name or "win64" in name or "win-" in name:
                 score += 6
             elif "win" in name:
                 score += 3
 
-            if "msvc" in name:
-                score += 8
+            # Clangtron is the only Windows toolchain produced upstream now.
+            if "clangtron" in name:
+                score += 12
+            elif "clang" in name:
+                score += 6
+
             if "x86_64" in name or "x64" in name or "amd64" in name:
                 score += 3
             if "citron" in name:
@@ -303,9 +556,6 @@ class UpdaterService:
             if "nightly" in name:
                 score += 2
 
-            # Removed/undesired variants.
-            if "mingw" in name or "clang" in name or "clangtron" in name:
-                score -= 50
             if "debug" in name or "symbols" in name or "pdb" in name:
                 score -= 4
             if "source" in name or name.endswith(("-src.zip", "_src.zip")):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Callable, Optional
@@ -12,7 +13,11 @@ from updater import (
     CHANNEL_NIGHTLY,
     CHANNEL_PR,
     CHANNEL_STABLE,
+    PR_BUILD_STATUS_BUILDING,
+    PR_BUILD_STATUS_MISSING,
+    PR_BUILD_STATUS_READY,
     CheckResult,
+    PullRequestBuild,
     ReleaseInfo,
     UpdaterError,
     UpdaterService,
@@ -20,12 +25,19 @@ from updater import (
 
 CHANNEL_LABELS = {
     CHANNEL_STABLE: "Stable (citron-neo/emulator)",
-    CHANNEL_NIGHTLY: "Nightly CI - MSVC (citron-neo/CI)",
-    CHANNEL_PR: "PR Builds (citron-neo/PR)",
+    CHANNEL_NIGHTLY: "Nightly CI - Clangtron (citron-neo/CI)",
+    CHANNEL_PR: "PR Builds (citron-neo/emulator)",
 }
 # Order matters for the dropdown: stable, nightly, PR.
 CHANNEL_ORDER = (CHANNEL_STABLE, CHANNEL_NIGHTLY, CHANNEL_PR)
 LABEL_TO_CHANNEL = {label: key for key, label in CHANNEL_LABELS.items()}
+
+PR_PLACEHOLDER_LABEL = "(no PRs loaded)"
+PR_STATUS_TEXT = {
+    PR_BUILD_STATUS_READY: "Ready - Clangtron Windows build available",
+    PR_BUILD_STATUS_BUILDING: "Building - check back once CI finishes",
+    PR_BUILD_STATUS_MISSING: "No usable Windows build for this PR",
+}
 
 
 class UpdaterApp:
@@ -38,6 +50,9 @@ class UpdaterApp:
         self.busy = False
         self._startup_check_done = False
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self.pr_builds: list[PullRequestBuild] = []
+        self.pr_label_lookup: dict[str, PullRequestBuild] = {}
+        self.selected_pr: Optional[PullRequestBuild] = None
 
         self.root = ctk.CTk()
         self.root.title("Citron Neo Updater")
@@ -54,7 +69,7 @@ class UpdaterApp:
 
     def _build_ui(self) -> None:
         self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(3, weight=1)
+        self.root.grid_rowconfigure(4, weight=1)
 
         title = ctk.CTkLabel(
             self.root,
@@ -94,8 +109,51 @@ class UpdaterApp:
         )
         self.channel_menu.grid(row=0, column=2, padx=12, pady=10, sticky="e")
 
+        self.pr_frame = ctk.CTkFrame(self.root)
+        self.pr_frame.grid(row=2, column=0, padx=20, pady=8, sticky="ew")
+        self.pr_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            self.pr_frame,
+            text="PR Build:",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, padx=12, pady=(10, 4), sticky="w")
+
+        self.pr_var = ctk.StringVar(value=PR_PLACEHOLDER_LABEL)
+        self.pr_menu = ctk.CTkOptionMenu(
+            self.pr_frame,
+            variable=self.pr_var,
+            values=[PR_PLACEHOLDER_LABEL],
+            command=self._on_pr_selected,
+        )
+        self.pr_menu.grid(row=0, column=1, padx=8, pady=(10, 4), sticky="ew")
+        self.pr_menu.configure(state="disabled")
+
+        self.pr_open_btn = ctk.CTkButton(
+            self.pr_frame,
+            text="Open PR on GitHub",
+            width=160,
+            command=self._open_selected_pr,
+        )
+        self.pr_open_btn.grid(row=0, column=2, padx=(8, 12), pady=(10, 4), sticky="e")
+        self.pr_open_btn.configure(state="disabled")
+
+        self.pr_status_var = ctk.StringVar(value="Switch to PR Builds and check for updates to populate this list.")
+        ctk.CTkLabel(
+            self.pr_frame,
+            textvariable=self.pr_status_var,
+            text_color="#bdbdbd",
+            font=ctk.CTkFont(size=13),
+            anchor="w",
+            justify="left",
+            wraplength=820,
+        ).grid(row=1, column=0, columnspan=3, padx=12, pady=(0, 10), sticky="ew")
+
+        # Hidden by default; toggled when the PR channel is selected.
+        self.pr_frame.grid_remove()
+
         controls_frame = ctk.CTkFrame(self.root)
-        controls_frame.grid(row=2, column=0, padx=20, pady=8, sticky="ew")
+        controls_frame.grid(row=3, column=0, padx=20, pady=8, sticky="ew")
         controls_frame.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
 
         self.check_btn = ctk.CTkButton(
@@ -135,7 +193,7 @@ class UpdaterApp:
         self.import_btn.grid(row=0, column=4, padx=8, pady=12, sticky="ew")
 
         progress_frame = ctk.CTkFrame(self.root)
-        progress_frame.grid(row=3, column=0, padx=20, pady=(8, 6), sticky="nsew")
+        progress_frame.grid(row=4, column=0, padx=20, pady=(8, 6), sticky="nsew")
         progress_frame.grid_columnconfigure(0, weight=1)
         progress_frame.grid_rowconfigure(2, weight=1)
 
@@ -177,6 +235,9 @@ class UpdaterApp:
         self.install_path_var.set(str(install_path))
         preferred = self.service.get_preferred_channel()
         self.channel_var.set(CHANNEL_LABELS.get(preferred, CHANNEL_LABELS[CHANNEL_NIGHTLY]))
+        self._set_pr_panel_visible(preferred == CHANNEL_PR)
+        if preferred == CHANNEL_PR:
+            self.pr_status_var.set("Loading open PRs from citron-neo/emulator...")
         self.log("Updater started.")
 
     def _maybe_show_first_run_setup(self) -> None:
@@ -295,6 +356,9 @@ class UpdaterApp:
         self.import_btn.configure(state=button_state)
         self.channel_menu.configure(state=button_state)
         self.update_btn.configure(state=button_state if self.current_release else "disabled")
+        pr_menu_state = button_state if self.pr_builds and not busy else "disabled"
+        self.pr_menu.configure(state=pr_menu_state)
+        self.pr_open_btn.configure(state=button_state if self.selected_pr else "disabled")
 
     def _progress_cb(self, value: float, status: str) -> None:
         self.ui_queue.put(lambda: self.progress_bar.set(max(0.0, min(1.0, value))))
@@ -308,10 +372,13 @@ class UpdaterApp:
     def check_updates(self) -> None:
         def task() -> None:
             self.ui_queue.put(lambda: self.status_var.set("Status: Checking for updates..."))
-            channel = self.service.get_preferred_channel().upper()
-            self.ui_queue.put(
-                lambda c=channel: self.log(f"Checking GitHub release (channel: {c})...")
-            )
+            channel = self.service.get_preferred_channel()
+            channel_upper = channel.upper()
+            if channel == CHANNEL_PR:
+                msg = "Scanning open PRs on citron-neo/emulator for Windows Clangtron builds..."
+            else:
+                msg = f"Checking GitHub release (channel: {channel_upper})..."
+            self.ui_queue.put(lambda m=msg: self.log(m))
             self.ui_queue.put(lambda: self.progress_bar.set(0))
             try:
                 result = self.service.check_for_updates()
@@ -324,10 +391,17 @@ class UpdaterApp:
         self._run_background(task)
 
     def _apply_check_result(self, result: CheckResult) -> None:
-        self.current_release = result.release
         self.current_version_var.set(f"Current: {result.current_version}")
         self.latest_version_var.set(f"Latest: {result.latest_version}")
 
+        channel = self.service.get_preferred_channel()
+
+        if channel == CHANNEL_PR:
+            self.current_release = None
+            self._populate_pr_dropdown(result.pull_requests)
+            return
+
+        self.current_release = result.release
         if result.update_available and result.release:
             self.status_var.set("Status: Update available")
             self.update_btn.configure(state="normal")
@@ -340,6 +414,122 @@ class UpdaterApp:
             self.update_btn.configure(state="disabled")
             self.log("No update needed.")
 
+    def _populate_pr_dropdown(self, prs: list[PullRequestBuild]) -> None:
+        self.pr_builds = list(prs or [])
+        self.selected_pr = None
+        self.current_release = None
+        self.pr_label_lookup = {}
+        labels: list[str] = []
+
+        ready_count = 0
+        building_count = 0
+        for pr in self.pr_builds:
+            label = pr.display_label
+            # Disambiguate duplicates that share the same display string.
+            base = label
+            n = 2
+            while label in self.pr_label_lookup:
+                label = f"{base} #{n}"
+                n += 1
+            self.pr_label_lookup[label] = pr
+            labels.append(label)
+            if pr.status == PR_BUILD_STATUS_READY:
+                ready_count += 1
+            elif pr.status == PR_BUILD_STATUS_BUILDING:
+                building_count += 1
+
+        if not labels:
+            labels = [PR_PLACEHOLDER_LABEL]
+            self.pr_var.set(PR_PLACEHOLDER_LABEL)
+            self.pr_menu.configure(values=labels, state="disabled")
+            self.pr_status_var.set(
+                "No open PRs were returned by GitHub. Check your network or try again later."
+            )
+            self.pr_open_btn.configure(state="disabled")
+            self.update_btn.configure(state="disabled")
+            self.status_var.set("Status: No PR builds available")
+            self.log("No open PRs returned for the PR channel.")
+            return
+
+        self.pr_menu.configure(values=labels, state="normal")
+
+        first_ready_label = next(
+            (lbl for lbl, pr in self.pr_label_lookup.items() if pr.status == PR_BUILD_STATUS_READY),
+            None,
+        )
+        default_label = first_ready_label or labels[0]
+        self.pr_var.set(default_label)
+        self._on_pr_selected(default_label)
+
+        summary = (
+            f"Loaded {len(self.pr_builds)} open PR(s) - "
+            f"{ready_count} ready, {building_count} building, "
+            f"{len(self.pr_builds) - ready_count - building_count} without Windows builds."
+        )
+        self.log(summary)
+        self.status_var.set(
+            f"Status: {ready_count} PR build(s) ready"
+            if ready_count
+            else "Status: No PR Windows builds ready yet"
+        )
+
+    def _on_pr_selected(self, selected_label: str) -> None:
+        pr = self.pr_label_lookup.get(selected_label)
+        self.selected_pr = pr
+        if not pr:
+            self.current_release = None
+            self.update_btn.configure(state="disabled")
+            self.pr_open_btn.configure(state="disabled")
+            self.pr_status_var.set("Select a PR to see its build status.")
+            return
+
+        self.pr_open_btn.configure(state="disabled" if self.busy else "normal")
+        commit_part = f"@ {pr.short_sha}" if pr.short_sha else ""
+        author_part = f"by {pr.author}" if pr.author else ""
+        meta = " ".join(part for part in (commit_part, author_part) if part)
+        status_text = PR_STATUS_TEXT.get(pr.status, pr.status)
+        self.pr_status_var.set(f"PR #{pr.number} {meta} - {status_text}")
+
+        if pr.status != PR_BUILD_STATUS_READY:
+            self.current_release = None
+            self.update_btn.configure(state="disabled")
+            return
+
+        try:
+            release = self.service.pr_build_to_release_info(pr)
+        except UpdaterError as exc:
+            self.current_release = None
+            self.update_btn.configure(state="disabled")
+            self.pr_status_var.set(f"PR #{pr.number}: {exc}")
+            return
+
+        self.current_release = release
+        self.latest_version_var.set(f"Latest: PR #{pr.number} ({pr.short_sha or 'unknown'})")
+        self.update_btn.configure(state="disabled" if self.busy else "normal")
+
+    def _open_selected_pr(self) -> None:
+        if not self.selected_pr:
+            return
+        url = self.selected_pr.pr_url
+        if not url:
+            return
+        try:
+            webbrowser.open(url, new=2)
+        except Exception as exc:
+            self._handle_error("Could not open PR in browser", exc)
+
+    def _set_pr_panel_visible(self, visible: bool) -> None:
+        if visible:
+            self.pr_frame.grid()
+        else:
+            self.pr_frame.grid_remove()
+            self.pr_builds = []
+            self.pr_label_lookup = {}
+            self.selected_pr = None
+            self.pr_var.set(PR_PLACEHOLDER_LABEL)
+            self.pr_menu.configure(values=[PR_PLACEHOLDER_LABEL], state="disabled")
+            self.pr_open_btn.configure(state="disabled")
+
     def _on_channel_changed(self, selected_label: str) -> None:
         channel = LABEL_TO_CHANNEL.get(selected_label, CHANNEL_NIGHTLY)
         try:
@@ -347,6 +537,11 @@ class UpdaterApp:
         except Exception as exc:
             self._handle_error("Channel setting failed", exc)
             return
+        self._set_pr_panel_visible(channel == CHANNEL_PR)
+        if channel == CHANNEL_PR:
+            self.pr_status_var.set("Loading open PRs from citron-neo/emulator...")
+        else:
+            self.pr_status_var.set("Switch to PR Builds and check for updates to populate this list.")
         self.log(f"Release channel set to {channel.upper()}.")
         self.status_var.set(f"Status: Release channel: {channel.upper()}")
         # Refresh release lookup to switch source repository immediately.
